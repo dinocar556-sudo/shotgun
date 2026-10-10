@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>책상 샷건</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #ecebe8;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* =========================================================
+ * 설정 (화면에는 아무것도 표시되지 않음)
+ * - 이미지 URL을 비워두면 코드로 직접 그린 책상/주먹을 사용합니다.
+ * - 외부 이미지를 쓰려면 아래에 URL을 넣으세요.
+ *   DESK_TOP_QUAD: 책상 이미지에서 "윗면" 네 꼭짓점 위치(이미지 가로/세로 대비 비율)
+ *                  [좌상, 우상, 우하, 좌하] — 금(crack)이 이 영역 위에 그려집니다.
+ * ========================================================= */
+const CONFIG = {
+  FIST_IMAGE_URL: '',
+  DESK_IMAGE_URL: '',
+  DESK_TOP_QUAD: [[0.06, 0.05], [0.94, 0.05], [1.0, 0.36], [0.0, 0.36]],
+};
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const deskLayer = document.createElement('canvas');
+const dctx = deskLayer.getContext('2d');
+
+const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+/* ---------------- 외부 이미지 (선택) ---------------- */
+function loadImg(url) {
+  if (!url) return null;
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => { img._ok = true; layout(); };
+  img.src = url;
+  return img;
+}
+const fistImg = loadImg(CONFIG.FIST_IMAGE_URL);
+const deskImg = loadImg(CONFIG.DESK_IMAGE_URL);
+const useDeskImg = () => deskImg && deskImg._ok;
+const useFistImg = () => fistImg && fistImg._ok;
+
+/* ---------------- 레이아웃 ---------------- */
+let vw, vh, dpr, deskW, deskH, deskX, deskY, floorY, F;
+let quad;            // 책상 윗면 사각형 (deskLayer 로컬 px)
+let bandH = 0;       // 앞쪽 두께 띠 높이 (벡터 책상 전용)
+let grainSeed = 12345;
+
+function layout() {
+  vw = window.innerWidth;
+  vh = window.innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(vw * dpr);
+  canvas.height = Math.round(vh * dpr);
+
+  deskW = Math.min(vw * 0.68, vh * 0.62);
+  const ratio = useDeskImg() ? deskImg.naturalHeight / deskImg.naturalWidth : 0.99;
+  deskH = deskW * ratio;
+  floorY = vh * 0.93;
+  deskX = (vw - deskW) / 2;
+  deskY = floorY - deskH;
+  F = deskW * 0.27;
+
+  if (useDeskImg()) {
+    quad = CONFIG.DESK_TOP_QUAD.map(([x, y]) => [x * deskW, y * deskH]);
+    bandH = 0;
+  } else {
+    quad = [[0.06, 0.02], [0.94, 0.02], [1.0, 0.34], [0.0, 0.34]].map(([x, y]) => [x * deskW, y * deskW]);
+    bandH = 0.05 * deskW;
+  }
+  deskLayer.width = Math.max(1, Math.round(deskW * dpr));
+  deskLayer.height = Math.max(1, Math.round(deskH * dpr));
+  buildSplitPoly();
+  renderDeskLayer();
+}
+
+/* 책상 윗면 좌표 (x: 0~1 가로, y: 0~DEPTH 깊이) → deskLayer 로컬 px */
+const DEPTH = 0.6;
+function mapPt(x, y) {
+  const u = clamp(x, 0, 1), v = clamp(y / DEPTH, 0, 1);
+  const [a, b, c, d] = quad;
+  const tx = lerp(a[0], b[0], u), ty = lerp(a[1], b[1], u);
+  const bx = lerp(d[0], c[0], u), by = lerp(d[1], c[1], u);
+  return [lerp(tx, bx, v), lerp(ty, by, v)];
+}
+
+/* ---------------- 균열 모델 ---------------- */
+const IX = 0.5, IY = 0.33;   // 타격 지점 (윗면 좌표)
+let branches = [];
+let splitPts = [];           // 정중앙 쪼개짐 라인 (윗면 좌표)
+let splitPoly = null;        // { left: [...], right: [...], line: [...] } (로컬 px)
+let edgeCracks = [];         // 앞쪽 띠/본체로 내려가는 금
+
+function newBranch(x, y, ang, w) {
+  const b = { pts: [[x, y]], ang, w, dead: false };
+  branches.push(b);
+  return b;
+}
+function grow(b, len, jit = 0.55, seg = 0.016) {
+  if (b.dead) return;
+  let [x, y] = b.pts[b.pts.length - 1];
+  let L = 0;
+  while (L < len) {
+    b.ang += (Math.random() - 0.5) * jit;
+    const s = seg * rand(0.6, 1.4);
+    x += Math.cos(b.ang) * s;
+    y += Math.sin(b.ang) * s;
+    L += s;
+    if (x <= 0 || x >= 1 || y <= 0 || y >= DEPTH) {
+      x = clamp(x, 0, 1); y = clamp(y, 0, DEPTH);
+      b.pts.push([x, y]);
+      b.dead = true;
+      if (y >= DEPTH - 1e-6) edgeCracks.push({ x, len: rand(0.4, 1), w: b.w });
+      break;
+    }
+    b.pts.push([x, y]);
+  }
+}
+function subBranch(parent, w, len) {
+  if (parent.pts.length < 3) return;
+  const i = 1 + Math.floor(Math.random() * (parent.pts.length - 2));
+  const [x, y] = parent.pts[i];
+  const [px, py] = parent.pts[i - 1];
+  const base = Math.atan2(y - py, x - px);
+  const b = newBranch(x, y, base + (Math.random() < 0.5 ? -1 : 1) * rand(0.5, 1.1), w);
+  grow(b, len);
+}
+function makeSplitLine() {
+  splitPts = [];
+  let x = IX + rand(-0.01, 0.01);
+  for (let y = IY; y >= 0; y -= rand(0.018, 0.035)) {
+    splitPts.unshift([x, y]);
+    x += rand(-0.022, 0.022);
+    x = lerp(x, 0.5, 0.15);
+  }
+  splitPts.unshift([x, 0]);
+  x = splitPts[splitPts.length - 1][0];
+  for (let y = IY + 0.02; y < DEPTH; y += rand(0.018, 0.035)) {
+    x += rand(-0.022, 0.022);
+    x = lerp(x, 0.5, 0.15);
+    splitPts.push([x, y]);
+  }
+  splitPts.push([x, DEPTH]);
+}
+function buildSplitPoly() {
+  if (!splitPts.length) return;
+  const line = splitPts.map(p => mapPt(p[0], p[1]));
+  let [lx, ly] = line[line.length - 1];
+  const bottom = deskH + 4;
+  while (ly < bottom) {
+    ly += deskW * rand(0.02, 0.04);
+    lx += deskW * rand(-0.012, 0.012);
+    line.push([lx, Math.min(ly, bottom)]);
+  }
+  const top = line[0];
+  const left = [[-40, -40], [top[0], -40], ...line, [line[line.length - 1][0], bottom + 40], [-40, bottom + 40]];
+  const right = [[deskW + 40, -40], [top[0], -40], ...line, [line[line.length - 1][0], bottom + 40], [deskW + 40, bottom + 40]];
+  splitPoly = { left, right, line };
+}
+
+/* 단계별 균열 성장 */
+function advanceCracks(stage) {
+  const main = branches.filter(b => b.main);
+  if (stage === 1) {
+    const n = 5;
+    for (let i = 0; i < n; i++) {
+      const b = newBranch(IX, IY, (i / n) * Math.PI * 2 + rand(-0.4, 0.4), 1.6);
+      b.main = true;
+      grow(b, rand(0.035, 0.06), 0.5, 0.01);
+    }
+  } else if (stage === 2) {
+    branches.forEach(b => { b.w *= 1.35; });
+    main.forEach(b => grow(b, rand(0.08, 0.15)));
+    for (let i = 0; i < 2; i++) {
+      const b = newBranch(IX, IY, rand(0, Math.PI * 2), 1.8);
+      b.main = true;
+      grow(b, rand(0.06, 0.1));
+    }
+    for (let i = 0; i < 4; i++) subBranch(main[Math.floor(Math.random() * main.length)], 1.0, rand(0.03, 0.06));
+  } else if (stage === 3) {
+    branches.forEach(b => { b.w *= 1.3; });
+    main.forEach(b => grow(b, rand(0.25, 0.5), 0.45, 0.02));
+    for (let i = 0; i < 6; i++) {
+      const b = newBranch(IX, IY, rand(0, Math.PI * 2), 2.4);
+      b.main = true;
+      grow(b, rand(0.3, 0.55), 0.45, 0.02);
+    }
+    const all = branches.slice();
+    for (let i = 0; i < 14; i++) subBranch(all[Math.floor(Math.random() * all.length)], rand(0.9, 1.5), rand(0.05, 0.14));
+  } else if (stage === 4) {
+    branches.forEach(b => { b.w *= 1.45; });
+    // 쪼개짐 예고: 앞뒤로 관통하는 큰 금
+    const mid = splitPts.findIndex(p => p[1] > IY);
+    const back = { pts: splitPts.slice(0, mid + 1).reverse(), w: 4.2, dead: true, main: false };
+    const front = { pts: splitPts.slice(Math.max(0, mid - 1)), w: 4.2, dead: true, main: false };
+    branches.push(back, front);
+    edgeCracks.push({ x: splitPts[splitPts.length - 1][0], len: 1.6, w: 4, split: true });
+    // 다른 곳에서도 거미줄 균열
+    for (let k = 0; k < 4; k++) {
+      const cx = rand(0.1, 0.9), cy = rand(0.08, DEPTH - 0.08);
+      for (let i = 0; i < 4; i++) {
+        const b = newBranch(cx, cy, rand(0, Math.PI * 2), 1.8);
+        grow(b, rand(0.06, 0.18), 0.6, 0.015);
+      }
+    }
+    const all = branches.slice();
+    for (let i = 0; i < 18; i++) subBranch(all[Math.floor(Math.random() * all.length)], rand(1, 1.8), rand(0.05, 0.16));
+    main.forEach(b => grow(b, rand(0.1, 0.3), 0.4, 0.02));
+  }
+}
+
+/* ---------------- 책상 그리기 (오프스크린) ---------------- */
+function drawVectorDesk(g, W) {
+  const R = mulberry32(grainSeed);
+  g.save();
+  g.scale(W, W);
+  g.lineJoin = 'round';
+  const out = 0.004;
+
+  // 뒷다리
+  function leg(x, y0, y1, w, dark) {
+    const gr = g.createLinearGradient(x - w / 2, 0, x + w / 2, 0);
+    gr.addColorStop(0, dark ? '#55595e' : '#6c7278');
+    gr.addColorStop(0.35, dark ? '#8b9096' : '#b7bcc2');
+    gr.addColorStop(1, dark ? '#3d4044' : '#5a5f65');
+    g.fillStyle = gr;
+    g.fillRect(x - w / 2, y0, w, y1 - y0);
+    g.fillStyle = '#2b2b2b';
+    rr(g, x - w * 0.75, y1 - 0.012, w * 1.5, 0.02, 0.006);
+    g.fill();
+  }
+  leg(0.12, 0.25, 0.9, 0.028, true);
+  leg(0.88, 0.25, 0.9, 0.028, true);
+  // 뒷다리 가로대
+  g.fillStyle = '#4a4e53';
+  g.fillRect(0.12, 0.8, 0.76, 0.012);
+
+  // 서랍(책 넣는 칸)
+  const dg = g.createLinearGradient(0, 0.37, 0, 0.5);
+  dg.addColorStop(0, '#5d6268');
+  dg.addColorStop(1, '#7c8289');
+  g.fillStyle = dg;
+  g.fillRect(0.1, 0.38, 0.8, 0.11);
+  g.fillStyle = '#3b3f44';
+  g.fillRect(0.12, 0.385, 0.76, 0.03);
+  g.strokeStyle = 'rgba(0,0,0,0.35)';
+  g.lineWidth = out;
+  g.strokeRect(0.1, 0.38, 0.8, 0.11);
+
+  // 앞다리
+  leg(0.055, 0.36, 0.98, 0.034, false);
+  leg(0.945, 0.36, 0.98, 0.034, false);
+  // 발받침
+  const fg = g.createLinearGradient(0, 0.84, 0, 0.86);
+  fg.addColorStop(0, '#b7bcc2');
+  fg.addColorStop(1, '#5a5f65');
+  g.fillStyle = fg;
+  g.fillRect(0.055, 0.84, 0.89, 0.018);
+
+  // 윗면 (나무)
+  const top = [[0.06, 0.02], [0.94, 0.02], [1.0, 0.34], [0.0, 0.34]];
+  g.beginPath();
+  top.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y));
+  g.closePath();
+  const tg = g.createLinearGradient(0, 0.02, 0, 0.34);
+  tg.addColorStop(0, '#d7a76b');
+  tg.addColorStop(1, '#e8bd85');
+  g.fillStyle = tg;
+  g.fill();
+  // 나뭇결
+  g.save();
+  g.clip();
+  for (let i = 0; i < 26; i++) {
+    const y = 0.02 + R() * 0.32;
+    g.beginPath();
+    const amp = 0.002 + R() * 0.006, ph = R() * 10, fr = 4 + R() * 8;
+    for (let x = -0.02; x <= 1.02; x += 0.02) {
+      const yy = y + Math.sin(x * fr + ph) * amp + (x - 0.5) * 0.004;
+      x <= -0.02 ? g.moveTo(x, yy) : g.lineTo(x, yy);
+    }
+    g.strokeStyle = R() < 0.5 ? 'rgba(150,95,45,0.18)' : 'rgba(255,235,200,0.22)';
+    g.lineWidth = 0.002 + R() * 0.004;
+    g.stroke();
+  }
+  // 옹이 하나
+  g.beginPath();
+  g.ellipse(0.22 + R() * 0.1, 0.1 + R() * 0.1, 0.03, 0.008, 0, 0, Math.PI * 2);
+  g.strokeStyle = 'rgba(130,80,35,0.25)';
+  g.lineWidth = 0.003;
+  g.stroke();
+  // 윗면 광택
+  const sh = g.createLinearGradient(0.2, 0, 0.8, 0.34);
+  sh.addColorStop(0, 'rgba(255,255,255,0)');
+  sh.addColorStop(0.5, 'rgba(255,255,255,0.13)');
+  sh.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = sh;
+  g.fillRect(0, 0, 1, 0.4);
+  g.restore();
+  g.beginPath();
+  top.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y));
+  g.closePath();
+  g.strokeStyle = '#a9733b';
+  g.lineWidth = out;
+  g.stroke();
+
+  // 앞쪽 두께 띠
+  const bg = g.createLinearGradient(0, 0.34, 0, 0.39);
+  bg.addColorStop(0, '#b57b40');
+  bg.addColorStop(1, '#8e5a2a');
+  g.fillStyle = bg;
+  g.fillRect(0, 0.34, 1, 0.05);
+  g.fillStyle = 'rgba(255,230,190,0.45)';
+  g.fillRect(0, 0.34, 1, 0.004);
+  g.strokeStyle = '#7a4a20';
+  g.lineWidth = out;
+  g.strokeRect(0, 0.34, 1, 0.05);
+  g.restore();
+}
+
+function drawCracks(g) {
+  const px = deskW / 600; // 굵기 기준
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  for (const b of branches) {
+    const pts = b.pts.map(p => mapPt(p[0], p[1]));
+    const n = pts.length - 1;
+    if (n < 1) continue;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        const w = Math.max(0.6, b.w * px * (1 - t * 0.75));
+        g.beginPath();
+        if (pass === 0) {
+          // 밝은 나무 속살 (가장자리)
+          g.moveTo(pts[i][0] + w * 0.5, pts[i][1] + w * 0.6);
+          g.lineTo(pts[i + 1][0] + w * 0.5, pts[i + 1][1] + w * 0.6);
+          g.strokeStyle = 'rgba(255,228,180,0.75)';
+          g.lineWidth = w * 1.1;
+        } else {
+          g.moveTo(pts[i][0], pts[i][1]);
+          g.lineTo(pts[i + 1][0], pts[i + 1][1]);
+          g.strokeStyle = 'rgba(45,22,6,0.95)';
+          g.lineWidth = w;
+        }
+        g.stroke();
+      }
+    }
+  }
+  // 앞쪽 띠로 내려가는 금
+  if (bandH > 0) {
+    for (const e of edgeCracks) {
+      const [x0, y0] = mapPt(e.x, DEPTH);
+      const yEnd = e.split ? deskW * 0.49 : y0 + bandH * e.len;
+      let x = x0, y = y0;
+      g.beginPath();
+      g.moveTo(x, y);
+      const R = mulberry32(Math.floor(e.x * 1e6));
+      while (y < yEnd) {
+        y += deskW * 0.012;
+        x += (R() - 0.5) * deskW * 0.01;
+        g.lineTo(x, Math.min(y, yEnd));
+      }
+      g.strokeStyle = 'rgba(40,20,5,0.95)';
+      g.lineWidth = Math.max(1, e.w * px * 0.8);
+      g.stroke();
+    }
+  }
+}
+
+function renderDeskLayer() {
+  dctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  dctx.clearRect(0, 0, deskW, deskH);
+  if (useDeskImg()) dctx.drawImage(deskImg, 0, 0, deskW, deskH);
+  else drawVectorDesk(dctx, deskW);
+  drawCracks(dctx);
+}
+
+/* ---------------- 주먹 그리기 ---------------- */
+function drawVectorFist(g, F) {
+  const skin = '#f3c39c', skinD = '#d9976b', line = '#9a5a35';
+  g.lineJoin = 'round';
+  g.lineCap = 'round';
+  g.lineWidth = F * 0.022;
+  g.strokeStyle = line;
+
+  // 팔뚝
+  const ag = g.createLinearGradient(-0.3 * F, 0, 0.3 * F, 0);
+  ag.addColorStop(0, skinD);
+  ag.addColorStop(0.4, skin);
+  ag.addColorStop(1, skinD);
+  g.fillStyle = ag;
+  g.beginPath();
+  g.moveTo(-0.28 * F, -0.8 * F);
+  g.lineTo(-0.3 * F, -8 * F);
+  g.lineTo(0.3 * F, -8 * F);
+  g.lineTo(0.27 * F, -0.8 * F);
+  g.closePath();
+  g.fill();
+  g.stroke();
+  // 소매
+  const sg = g.createLinearGradient(-0.42 * F, 0, 0.42 * F, 0);
+  sg.addColorStop(0, '#2c3e57');
+  sg.addColorStop(0.45, '#4a6489');
+  sg.addColorStop(1, '#25354b');
+  g.fillStyle = sg;
+  rr(g, -0.42 * F, -9 * F, 0.84 * F, 7.4 * F, 0.08 * F);
+  g.fill();
+  g.strokeStyle = '#1d2a3b';
+  g.stroke();
+  g.fillStyle = '#e9edf2';
+  rr(g, -0.43 * F, -1.72 * F, 0.86 * F, 0.12 * F, 0.04 * F);
+  g.fill();
+  g.stroke();
+  g.strokeStyle = line;
+
+  // 손바닥/손등 덩어리
+  const pg = g.createLinearGradient(-0.46 * F, 0, 0.46 * F, 0);
+  pg.addColorStop(0, skinD);
+  pg.addColorStop(0.35, skin);
+  pg.addColorStop(1, '#e8ad83');
+  g.fillStyle = pg;
+  rr(g, -0.47 * F, -1.0 * F, 0.9 * F, 0.97 * F, 0.24 * F);
+  g.fill();
+  g.stroke();
+
+  // 말아쥔 손가락 4개 (아래로 갈수록 새끼손가락)
+  const fingers = [
+    [-0.12, -0.80, 0.62, 0.23],
+    [-0.12, -0.59, 0.63, 0.22],
+    [-0.10, -0.39, 0.60, 0.21],
+    [-0.06, -0.20, 0.52, 0.19],
+  ];
+  for (let i = fingers.length - 1; i >= 0; i--) {
+    const [x, y, w, h] = fingers[i].map(v => v * F);
+    const fg = g.createLinearGradient(0, y, 0, y + h);
+    fg.addColorStop(0, '#f8d2b2');
+    fg.addColorStop(0.55, skin);
+    fg.addColorStop(1, skinD);
+    g.fillStyle = fg;
+    rr(g, x, y, w, h, h * 0.5);
+    g.fill();
+    g.stroke();
+    // 마디 주름
+    g.beginPath();
+    g.moveTo(x + w * 0.62, y + h * 0.25);
+    g.quadraticCurveTo(x + w * 0.58, y + h * 0.5, x + w * 0.62, y + h * 0.75);
+    g.lineWidth = F * 0.012;
+    g.stroke();
+    g.lineWidth = F * 0.022;
+  }
+
+  // 엄지
+  g.save();
+  g.translate(-0.1 * F, -0.9 * F);
+  g.rotate(-0.06);
+  const tg = g.createLinearGradient(0, -0.12 * F, 0, 0.12 * F);
+  tg.addColorStop(0, '#f9d8bb');
+  tg.addColorStop(1, '#e4a77c');
+  g.fillStyle = tg;
+  rr(g, -0.36 * F, -0.12 * F, 0.68 * F, 0.24 * F, 0.12 * F);
+  g.fill();
+  g.stroke();
+  g.fillStyle = '#fbe4d3';
+  rr(g, 0.15 * F, -0.08 * F, 0.13 * F, 0.16 * F, 0.06 * F);
+  g.fill();
+  g.lineWidth = F * 0.012;
+  g.stroke();
+  g.restore();
+}
+
+function drawFist(g, cx, bottom, sx, sy, alpha) {
+  g.save();
+  g.globalAlpha = alpha;
+  g.translate(cx, bottom);
+  g.scale(sx, sy);
+  if (useFistImg()) {
+    const w = F * 1.15, h = w * fistImg.naturalHeight / fistImg.naturalWidth;
+    g.drawImage(fistImg, -w / 2, -h, w, h);
+  } else {
+    drawVectorFist(g, F);
+  }
+  g.restore();
+}
+
+/* ---------------- 오디오 (Web Audio 합성) ---------------- */
+let AC = null, master = null, noiseBuf = null, shaper = null;
+function ensureAudio() {
+  if (!AC) {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return false;
+    AC = new Ctor();
+    const comp = AC.createDynamicsCompressor();
+    comp.threshold.value = -8;
+    comp.knee.value = 6;
+    comp.ratio.value = 5;
+    comp.attack.value = 0.002;
+    comp.release.value = 0.2;
+    master = AC.createGain();
+    master.gain.value = 0.95;
+    master.connect(comp);
+    comp.connect(AC.destination);
+    const len = AC.sampleRate * 2;
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    shaper = AC.createWaveShaper();
+    const curve = new Float32Array(1024);
+    for (let i = 0; i < 1024; i++) {
+      const x = i / 512 - 1;
+      curve[i] = Math.tanh(x * 3.5);
+    }
+    shaper.curve = curve;
+    shaper.connect(master);
+  }
+  if (AC.state === 'suspended') AC.resume();
+  return true;
+}
+function env(gainNode, t, peak, attack, decay) {
+  const gp = gainNode.gain;
+  gp.setValueAtTime(0.0001, t);
+  gp.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + attack);
+  gp.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+}
+function noise(t, { type = 'lowpass', freq = 1000, Q = 1, gain = 0.5, attack = 0.002, decay = 0.2, dest } = {}) {
+  const src = AC.createBufferSource();
+  src.buffer = noiseBuf;
+  const f = AC.createBiquadFilter();
+  f.type = type;
+  f.frequency.value = freq;
+  f.Q.value = Q;
+  const gn = AC.createGain();
+  env(gn, t, gain, attack, decay);
+  src.connect(f); f.connect(gn); gn.connect(dest || master);
+  src.start(t, Math.random() * 1.5);
+  src.stop(t + attack + decay + 0.05);
+}
+function tone(t, f0, f1, dur, gain, type = 'sine', dest) {
+  const o = AC.createOscillator();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const gn = AC.createGain();
+  env(gn, t, gain, 0.003, dur);
+  o.connect(gn); gn.connect(dest || master);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+}
+function crackle(t0, count, spread, gain) {
+  for (let i = 0; i < count; i++) {
+    noise(t0 + Math.random() * spread, {
+      type: 'bandpass', freq: rand(1400, 5200), Q: rand(2, 7),
+      gain: gain * rand(0.4, 1), decay: rand(0.015, 0.06),
+    });
+  }
+}
+function snap(t, gain) { // 나무가 "쩍" 갈라지는 소리
+  noise(t, { type: 'highpass', freq: 1300, gain: gain, decay: 0.12 });
+  noise(t, { type: 'bandpass', freq: 700, Q: 3, gain: gain * 0.8, decay: 0.18 });
+  tone(t, 520, 140, 0.12, gain * 0.35, 'triangle');
+  crackle(t, 6, 0.08, gain * 0.5);
+}
+function creak(t, dur, gain) {
+  const o = AC.createOscillator();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(95, t);
+  o.frequency.linearRampToValueAtTime(70, t + dur);
+  const lfo = AC.createOscillator();
+  lfo.frequency.value = 23;
+  const lg = AC.createGain();
+  lg.gain.value = 18;
+  lfo.connect(lg); lg.connect(o.frequency);
+  const f = AC.createBiquadFilter();
+  f.type = 'bandpass'; f.frequency.value = 950; f.Q.value = 6;
+  const gn = AC.createGain();
+  env(gn, t, gain, 0.05, dur);
+  o.connect(f); f.connect(gn); gn.connect(master);
+  o.start(t); lfo.start(t);
+  o.stop(t + dur + 0.1); lfo.stop(t + dur + 0.1);
+}
+function thud(p) { // 주먹으로 책상 "쾅!"
+  const t = AC.currentTime + 0.002;
+  tone(t, 160, 42, 0.32 + 0.1 * p, 0.95 * p, 'sine');
+  tone(t, 95, 38, 0.45, 0.55 * p, 'triangle', shaper);
+  noise(t, { type: 'lowpass', freq: 900, gain: 0.85 * p, decay: 0.14 });
+  noise(t, { type: 'bandpass', freq: 2300, Q: 1.2, gain: 0.35 * p, decay: 0.035 });
+  noise(t + 0.01, { type: 'bandpass', freq: 420, Q: 6, gain: 0.3 * p, decay: 0.3 }); // 책상 울림
+  tone(t + 0.005, 210, 190, 0.25, 0.12 * p, 'square'); // 철제 다리 떨림
+}
+function boom() { // 5단계 "쿠쾅-!!! 와장창"
+  const t = AC.currentTime + 0.002;
+  tone(t, 120, 26, 1.3, 1.0, 'sine', shaper);
+  tone(t, 70, 24, 1.6, 0.8, 'sine');
+  noise(t, { type: 'lowpass', freq: 700, gain: 1.0, decay: 1.4 });
+  noise(t, { type: 'bandpass', freq: 1800, Q: 0.8, gain: 0.7, decay: 0.45 });
+  snap(t + 0.01, 0.9);
+  snap(t + 0.12, 0.7);
+  crackle(t, 45, 1.0, 0.5);
+  // 반쪽이 바닥에 주저앉는 소리
+  tone(t + 0.32, 110, 40, 0.5, 0.8, 'sine');
+  noise(t + 0.32, { type: 'lowpass', freq: 600, gain: 0.7, decay: 0.4 });
+  tone(t + 0.36, 300, 260, 0.5, 0.18, 'square'); // 철제 다리 쨍
+  tone(t + 0.36, 455, 430, 0.6, 0.1, 'square');
+  // 나무 조각들 "와장창" 떨어지는 소리
+  for (let i = 0; i < 16; i++) {
+    const tt = t + rand(0.25, 1.6);
+    const fr = rand(250, 900);
+    noise(tt, { type: 'bandpass', freq: fr, Q: rand(6, 14), gain: rand(0.15, 0.4), decay: rand(0.05, 0.15) });
+    tone(tt, fr, fr * 0.8, 0.08, rand(0.05, 0.12), 'triangle');
+  }
+}
+function playStage(stage) {
+  if (!ensureAudio()) return;
+  const t = AC.currentTime;
+  if (stage === 1) thud(0.8);
+  else if (stage === 2) { thud(0.9); crackle(t + 0.02, 5, 0.15, 0.25); }
+  else if (stage === 3) { thud(1.0); snap(t + 0.03, 0.45); crackle(t + 0.02, 16, 0.35, 0.35); }
+  else if (stage === 4) {
+    thud(1.1);
+    snap(t + 0.05, 0.7);
+    snap(t + 0.24, 0.6);
+    snap(t + 0.46, 0.75);
+    creak(t + 0.1, 0.7, 0.25);
+    crackle(t + 0.02, 26, 0.7, 0.4);
+  }
+  else if (stage === 5) boom();
+}
+
+/* ---------------- 상태 & 연출 ---------------- */
+let stage = 0;
+let hit = null;            // { start, stage, impacted }
+let collapse = null;       // { start }
+let particles = [];
+let rings = [];
+let shake = { amp: 0, dur: 1, start: 0, rot: 0 };
+let flash = { start: -1e9, dur: 1, alpha: 0 };
+let popStart = -1e9;
+let squash = { start: -1e9 };
+let lastFistBottom = null;
+
+const T_UP = 70, T_DOWN = 70, T_HOLD = 70, T_BACK = 320;
+
+function idleBottom(now) {
+  return deskY + quad[0][1] - deskW * 0.2 + Math.sin(now / 420) * deskW * 0.01;
+}
+function impactScreen() {
+  const [x, y] = mapPt(IX, IY);
+  return [deskX + x, deskY + y];
+}
+
+function punch(now) {
+  if (stage >= 5) return;
+  if (hit && !hit.impacted) return;
+  stage++;
+  hit = { start: now, stage, impacted: false };
+}
+
+function addShake(now, amp, dur, rot = 0) {
+  shake = { amp, dur, start: now, rot };
+}
+
+function onImpact(now, s) {
+  const [ix, iy] = impactScreen();
+  const k = deskW / 600;
+  playStage(s);
+  squash.start = now;
+  rings.push({ x: ix, y: iy, start: now, dur: s === 5 ? 420 : 260, size: (s === 5 ? 1.8 : 0.8 + s * 0.12) * F });
+  if (s < 5) {
+    advanceCracks(s);
+    renderDeskLayer();
+  }
+  if (s === 1) {
+    addShake(now, 16 * k, 100);
+    spawnChips(ix, iy, 8, 0.4, false);
+  } else if (s === 2) {
+    addShake(now, 20 * k, 160);
+    spawnChips(ix, iy, 16, 0.6, false);
+  } else if (s === 3) {
+    addShake(now, 28 * k, 240, 0.006);
+    spawnChips(ix, iy, 70, 1.0, true);
+  } else if (s === 4) {
+    addShake(now, 40 * k, 380, 0.012);
+    spawnChips(ix, iy, 110, 1.2, true);
+    // 쩍쩍 갈라지는 소리에 맞춘 추가 흔들림
+    [240, 460].forEach(d => setTimeout(() => addShake(performance.now(), 24 * k, 180, 0.008), d));
+  } else if (s === 5) {
+    addShake(now, 70 * k, 650, 0.025);
+    flash = { start: now, dur: 160, alpha: 0.7 };
+    collapse = { start: now };
+    spawnExplosion();
+  }
+}
+
+const WOOD = ['#c8955a', '#b07a3f', '#e2b57c', '#8f5d2c', '#d9a86a', '#f0d2a6', '#a46a33'];
+function spawnParticle(x, y, vx, vy, size, chunk) {
+  const s = deskW / 600;
+  particles.push({
+    x, y, vx, vy,
+    rot: rand(0, Math.PI * 2), vr: rand(-14, 14),
+    w: size * rand(0.6, 1.4), h: size * rand(0.18, 0.45) * (chunk ? 2.2 : 1),
+    color: WOOD[Math.floor(Math.random() * WOOD.length)],
+    floor: floorY + rand(-0.02, 0.03) * deskW,
+    life: rand(1.6, 2.8), age: 0, chunk, s,
+    ground: false,
+  });
+}
+function spawnChips(ix, iy, n, power, spread) {
+  const s = deskW / 600;
+  for (let i = 0; i < n; i++) {
+    const x = ix + (spread ? rand(-0.35, 0.35) * deskW * Math.random() : rand(-0.03, 0.03) * deskW);
+    const y = iy + (spread ? rand(-0.08, 0.08) * deskW : 0);
+    const a = rand(-Math.PI * 0.95, -Math.PI * 0.05);
+    const sp = rand(150, 650) * power * s;
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(4, 11) * s, false);
+  }
+  // 먼지
+  for (let i = 0; i < 4 + n / 6; i++) {
+    particles.push({
+      dust: true, x: ix + rand(-0.1, 0.1) * deskW * power, y: iy + rand(-0.02, 0.02) * deskW,
+      vx: rand(-80, 80) * s, vy: rand(-90, -20) * s, r: rand(10, 22) * s * (0.6 + power * 0.5),
+      age: 0, life: rand(0.5, 0.9),
+    });
+  }
+}
+function spawnExplosion() {
+  const s = deskW / 600;
+  const line = splitPoly ? splitPoly.line : [[deskW / 2, 0], [deskW / 2, deskH]];
+  for (let i = 0; i < 420; i++) {
+    const p = line[Math.floor(Math.random() * Math.min(line.length, 30))];
+    const x = deskX + p[0] + rand(-0.04, 0.04) * deskW;
+    const y = deskY + p[1];
+    const a = rand(-Math.PI, 0) + rand(-0.3, 0.3);
+    const sp = rand(200, 1300) * s;
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp - rand(0, 250) * s, rand(5, 15) * s, false);
+  }
+  for (let i = 0; i < 46; i++) {
+    const p = line[Math.floor(Math.random() * line.length)];
+    const a = rand(-Math.PI * 0.92, -Math.PI * 0.08);
+    const sp = rand(250, 850) * s;
+    spawnParticle(deskX + p[0], deskY + p[1], Math.cos(a) * sp, Math.sin(a) * sp, rand(16, 34) * s, true);
+  }
+  const [ix, iy] = impactScreen();
+  for (let i = 0; i < 26; i++) {
+    particles.push({
+      dust: true, x: ix + rand(-0.3, 0.3) * deskW, y: iy + rand(-0.05, 0.3) * deskW,
+      vx: rand(-220, 220) * s, vy: rand(-160, -10) * s, r: rand(20, 50) * s,
+      age: 0, life: rand(0.8, 1.6),
+    });
+  }
+}
+
+function reset() {
+  stage = 0;
+  hit = null;
+  collapse = null;
+  particles = [];
+  rings = [];
+  branches = [];
+  edgeCracks = [];
+  grainSeed = (Math.random() * 1e9) | 0;
+  makeSplitLine();
+  buildSplitPoly();
+  renderDeskLayer();
+  popStart = performance.now();
+  shake.amp = 0;
+}
+
+/* ---------------- 업데이트 & 렌더 ---------------- */
+const easeOutBounce = (x) => {
+  const n1 = 7.5625, d1 = 2.75;
+  if (x < 1 / d1) return n1 * x * x;
+  if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
+  if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
+  return n1 * (x -= 2.625 / d1) * x + 0.984375;
+};
+const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
+
+function fistBottom(now) {
+  const idle = idleBottom(now);
+  if (!hit) return idle;
+  const [, iy] = impactScreen();
+  const contact = iy + deskW * (hit.stage === 5 ? 0.16 : 0.012);
+  const t = now - hit.start;
+  if (t < T_UP) return lerp(idle, idle - deskW * 0.07, easeOutCubic(t / T_UP));
+  const top = idle - deskW * 0.07;
+  if (t < T_UP + T_DOWN) {
+    const x = (t - T_UP) / T_DOWN;
+    return lerp(top, contact, x * x);
+  }
+  if (!hit.impacted) { hit.impacted = true; onImpact(now, hit.stage); }
+  if (t < T_UP + T_DOWN + T_HOLD) return contact;
+  const x = (t - T_UP - T_DOWN - T_HOLD) / T_BACK;
+  if (x >= 1) { hit = null; return idle; }
+  return lerp(contact, idle, easeOutCubic(x));
+}
+
+function updateParticles(dt) {
+  const g = 2600 * (deskW / 600);
+  for (const p of particles) {
+    p.age += dt;
+    if (p.dust) {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.94; p.vy *= 0.94;
+      continue;
+    }
+    if (!p.ground) {
+      p.vy += g * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+      if (p.y > p.floor) {
+        p.y = p.floor;
+        if (Math.abs(p.vy) > 180 * p.s) {
+          p.vy *= -0.32; p.vx *= 0.6; p.vr *= 0.5;
+        } else { p.ground = true; p.vy = 0; }
+      }
+    } else {
+      p.vx *= 0.85;
+      p.x += p.vx * dt;
+    }
+  }
+  particles = particles.filter(p => p.age < p.life);
+}
+
+function drawParticles(g) {
+  for (const p of particles) {
+    const fade = clamp((p.life - p.age) / 0.5, 0, 1);
+    if (p.dust) {
+      const a = (1 - p.age / p.life) * 0.35;
+      const r = p.r * (1 + p.age / p.life * 1.4);
+      g.fillStyle = `rgba(214,190,155,${a})`;
+      g.beginPath();
+      g.arc(p.x, p.y, r, 0, Math.PI * 2);
+      g.fill();
+      continue;
+    }
+    g.save();
+    g.globalAlpha = fade;
+    g.translate(p.x, p.y);
+    g.rotate(p.rot);
+    g.fillStyle = p.color;
+    if (p.chunk) {
+      g.beginPath();
+      g.moveTo(-p.w / 2, -p.h / 2);
+      g.lineTo(p.w / 2, -p.h * 0.3);
+      g.lineTo(p.w * 0.35, p.h / 2);
+      g.lineTo(-p.w * 0.45, p.h * 0.35);
+      g.closePath();
+      g.fill();
+      g.strokeStyle = 'rgba(90,50,20,0.6)';
+      g.lineWidth = Math.max(1, p.s);
+      g.stroke();
+    } else {
+      g.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    }
+    g.restore();
+  }
+}
+
+function drawDeskHalf(g, poly, pivotX, pivotY, ang, tx, ty) {
+  g.save();
+  g.translate(deskX + tx, deskY + ty);
+  g.translate(pivotX, pivotY);
+  g.rotate(ang);
+  g.translate(-pivotX, -pivotY);
+  g.beginPath();
+  poly.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y));
+  g.closePath();
+  g.clip();
+  g.drawImage(deskLayer, 0, 0, deskW, deskH);
+  // 쪼개진 단면
+  const edgeLimit = useDeskImg() ? deskH : deskW * 0.49; // 서랍 아래(빈 공간)에는 단면을 그리지 않음
+  g.beginPath();
+  let started = false;
+  for (const [x, y] of splitPoly.line) {
+    if (y > edgeLimit) break;
+    started ? g.lineTo(x, y) : g.moveTo(x, y);
+    started = true;
+  }
+  g.strokeStyle = '#3a1f0a';
+  g.lineWidth = Math.max(2, deskW * 0.008);
+  g.lineJoin = 'round';
+  g.stroke();
+  g.strokeStyle = 'rgba(255,225,170,0.9)';
+  g.lineWidth = Math.max(1, deskW * 0.003);
+  g.stroke();
+  g.restore();
+}
+
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+
+  const fb = fistBottom(now);
+  updateParticles(dt);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // 배경
+  const bg = ctx.createLinearGradient(0, 0, 0, vh);
+  bg.addColorStop(0, '#f6f6f4');
+  bg.addColorStop(0.75, '#ecebe8');
+  bg.addColorStop(1, '#e3e1dd');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, vw, vh);
+
+  // 화면 흔들림
+  const st = (now - shake.start) / shake.dur;
+  if (st < 1 && shake.amp > 0) {
+    const k = Math.pow(1 - st, 1.6);
+    ctx.translate(vw / 2, vh / 2);
+    ctx.rotate(rand(-1, 1) * shake.rot * k);
+    ctx.translate(-vw / 2, -vh / 2);
+    ctx.translate(rand(-1, 1) * shake.amp * k, rand(-1, 1) * shake.amp * k);
+  }
+
+  // 리셋 시 살짝 튀어나오는 연출
+  const pt = clamp((now - popStart) / 260, 0, 1);
+  const pop = pt < 1 ? 0.94 + 0.06 * easeOutCubic(pt) + Math.sin(pt * Math.PI) * 0.02 : 1;
+  ctx.save();
+  ctx.translate(vw / 2, floorY);
+  ctx.scale(pop, pop);
+  ctx.translate(-vw / 2, -floorY);
+
+  // 바닥 그림자
+  const shW = collapse ? deskW * 0.62 : deskW * 0.56;
+  const sg = ctx.createRadialGradient(vw / 2, floorY, 0, vw / 2, floorY, shW);
+  sg.addColorStop(0, 'rgba(0,0,0,0.16)');
+  sg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sg;
+  ctx.save();
+  ctx.translate(vw / 2, floorY);
+  ctx.scale(1, 0.09);
+  ctx.translate(-vw / 2, -floorY);
+  ctx.beginPath();
+  ctx.arc(vw / 2, floorY, shW, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // 책상
+  if (collapse && splitPoly) {
+    const ct = clamp((now - collapse.start) / 750, 0, 1);
+    const open = clamp((now - collapse.start) / 90, 0, 1);
+    const e = easeOutBounce(ct);
+    const ang = 0.36 * e;
+    const tx = deskW * (0.012 * open + 0.06 * e);
+    const ty = deskW * 0.11 * e;
+    drawDeskHalf(ctx, splitPoly.left, deskW * 0.28, deskH * 0.6, ang, -tx, ty);
+    drawDeskHalf(ctx, splitPoly.right, deskW * 0.72, deskH * 0.6, -ang, tx, ty);
+  } else {
+    ctx.drawImage(deskLayer, deskX, deskY, deskW, deskH);
+  }
+
+  // 충격 링
+  for (const r of rings) {
+    const t = (now - r.start) / r.dur;
+    if (t >= 1) continue;
+    const e = easeOutCubic(t);
+    ctx.beginPath();
+    ctx.ellipse(r.x, r.y, r.size * (0.3 + e), r.size * (0.3 + e) * 0.32, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,255,255,${0.85 * (1 - t)})`;
+    ctx.lineWidth = Math.max(2, deskW * 0.012 * (1 - t));
+    ctx.stroke();
+  }
+  rings = rings.filter(r => now - r.start < r.dur);
+
+  drawParticles(ctx);
+
+  // 주먹 (내려칠 때 잔상)
+  const sqT = (now - squash.start) / 140;
+  let sx = 1, sy = 1;
+  if (sqT >= 0 && sqT < 1) {
+    const k = Math.sin(sqT * Math.PI) * (stage === 5 ? 0.14 : 0.09);
+    sx = 1 + k; sy = 1 - k;
+  }
+  if (lastFistBottom !== null && fb - lastFistBottom > deskW * 0.04) {
+    drawFist(ctx, vw / 2, lastFistBottom + (fb - lastFistBottom) * 0.35, 1, 1, 0.18);
+    drawFist(ctx, vw / 2, lastFistBottom + (fb - lastFistBottom) * 0.7, 1, 1, 0.3);
+  }
+  drawFist(ctx, vw / 2, fb, sx, sy, 1);
+  lastFistBottom = fb;
+
+  ctx.restore();
+
+  // 섬광
+  const ft = (now - flash.start) / flash.dur;
+  if (ft >= 0 && ft < 1) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = `rgba(255,255,255,${flash.alpha * (1 - ft)})`;
+    ctx.fillRect(0, 0, vw, vh);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 입력 ---------------- */
+let lastDown = { t: -1e9, x: 0, y: 0 };
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  ensureAudio();
+  const now = performance.now();
+  const dbl = now - lastDown.t < 330 && Math.hypot(e.clientX - lastDown.x, e.clientY - lastDown.y) < 60;
+  if (dbl) {
+    lastDown.t = -1e9;
+    reset();
+    return;
+  }
+  lastDown = { t: now, x: e.clientX, y: e.clientY };
+  punch(now);
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ' || e.code === 'Enter') {
+    e.preventDefault();
+    if (e.repeat) return;
+    ensureAudio();
+    punch(performance.now());
+  } else if (e.key === 'r' || e.key === 'R' || e.key === 'Escape') {
+    reset();
+  } else if (e.key === 'f' || e.key === 'F') {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+    else document.exitFullscreen?.();
+  }
+});
+window.addEventListener('resize', layout);
+
+makeSplitLine();
+layout();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
