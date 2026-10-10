@@ -33,14 +33,18 @@
 
 /* =========================================================
  * 설정 (화면에는 아무것도 표시되지 않음)
- * - 이미지 URL을 비워두면 코드로 직접 그린 책상/주먹을 사용합니다.
- * - 외부 이미지를 쓰려면 아래에 URL을 넣으세요.
- *   DESK_TOP_QUAD: 책상 이미지에서 "윗면" 네 꼭짓점 위치(이미지 가로/세로 대비 비율)
+ * - index.html 과 같은 폴더에 fist.png / desk.png 를 두면 자동으로 사용합니다.
+ *   (파일이 없거나 못 읽으면 코드로 그린 책상/주먹으로 대체)
+ * - 인터넷 주소(https://...)를 넣어도 됩니다.
+ * - FIST_SCALE: 주먹 이미지 크기 배율 (1 = 책상 폭의 약 31%)
+ * - DESK_TOP_QUAD: 책상 이미지에서 "윗면" 네 꼭짓점 위치(이미지 가로/세로 대비 비율)
  *                  [좌상, 우상, 우하, 좌하] — 금(crack)이 이 영역 위에 그려집니다.
+ *                  G 키를 누르면 이 영역이 빨간 선으로 보여서 맞추기 쉽습니다.
  * ========================================================= */
 const CONFIG = {
-  FIST_IMAGE_URL: '',
-  DESK_IMAGE_URL: '',
+  FIST_IMAGE_URL: 'fist.png',
+  DESK_IMAGE_URL: 'desk.png',
+  FIST_SCALE: 1.0,
   DESK_TOP_QUAD: [[0.06, 0.05], [0.94, 0.05], [1.0, 0.36], [0.0, 0.36]],
 };
 
@@ -75,8 +79,8 @@ function rr(g, x, y, w, h, r) {
 function loadImg(url) {
   if (!url) return null;
   const img = new Image();
-  img.crossOrigin = 'anonymous';
   img.onload = () => { img._ok = true; layout(); };
+  img.onerror = () => { img._ok = false; };
   img.src = url;
   return img;
 }
@@ -519,7 +523,7 @@ function drawFist(g, cx, bottom, sx, sy, alpha) {
   g.translate(cx, bottom);
   g.scale(sx, sy);
   if (useFistImg()) {
-    const w = F * 1.15, h = w * fistImg.naturalHeight / fistImg.naturalWidth;
+    const w = F * 1.15 * CONFIG.FIST_SCALE, h = w * fistImg.naturalHeight / fistImg.naturalWidth;
     g.drawImage(fistImg, -w / 2, -h, w, h);
   } else {
     drawVectorFist(g, F);
@@ -681,6 +685,7 @@ let flash = { start: -1e9, dur: 1, alpha: 0 };
 let popStart = -1e9;
 let squash = { start: -1e9 };
 let lastFistBottom = null;
+let showGuide = false;
 
 const T_UP = 70, T_DOWN = 70, T_HOLD = 70, T_BACK = 320;
 
@@ -1026,6 +1031,18 @@ function frame(now) {
 
   ctx.restore();
 
+  // 윗면 영역 확인용 가이드 (G 키)
+  if (showGuide) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.beginPath();
+    quad.forEach(([x, y], i) => i ? ctx.lineTo(deskX + x, deskY + y) : ctx.moveTo(deskX + x, deskY + y));
+    ctx.closePath();
+    ctx.strokeStyle = 'red';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.strokeRect(deskX, deskY, deskW, deskH);
+  }
+
   // 섬광
   const ft = (now - flash.start) / flash.dur;
   if (ft >= 0 && ft < 1) {
@@ -1061,6 +1078,8 @@ window.addEventListener('keydown', (e) => {
     punch(performance.now());
   } else if (e.key === 'r' || e.key === 'R' || e.key === 'Escape') {
     reset();
+  } else if (e.key === 'g' || e.key === 'G') {
+    showGuide = !showGuide;
   } else if (e.key === 'f' || e.key === 'F') {
     if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
     else document.exitFullscreen?.();
